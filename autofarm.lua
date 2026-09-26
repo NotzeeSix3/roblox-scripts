@@ -46,6 +46,8 @@ local CONFIG = {
     RemoteClaimIndex = "SetClaimIndex",
     RemoteEquipBest  = "SetEquipBest",
     RemoteRarity     = "SetRarityFilter",
+    RemoteRarityAlt  = "StealRarityFilter",
+    RemoteZoneFilter = "StealZoneFilter",
     RemoteSpeed      = "SetWalkSpeedEnabled",
     RemoteSpeedVal   = "SetWalkSpeedValue",
     RemotePlace      = "SetPlace",
@@ -67,7 +69,8 @@ local CONFIG = {
     ClaimInterval  = 5.0,
     EquipInterval  = 3.0,
     SpeedValue     = 60,
-    RarityTarget   = "ALL",
+    RarityTarget   = "ALL",      -- ALL/Common/Uncommon/Rare/Epic/Legendary/Mythical
+    ZoneTarget     = "ALL",      -- ALL/Zone1/Zone2/Zone3
     Debug          = true,
 }
 
@@ -146,6 +149,21 @@ end
 local function doClaimIndex() safeFireServer(getRemote(CONFIG.RemoteClaimIndex), true) end
 local function doEquipBest()  safeFireServer(getRemote(CONFIG.RemoteEquipBest),  true) end
 local function doPlace()      safeFireServer(getRemote(CONFIG.RemotePlace),       true) end
+
+-- Filter rarity & zona saat steal
+local function applyRarityFilter(rarity)
+    if not rarity or rarity == "ALL" then return end
+    if not safeFireServer(getRemote(CONFIG.RemoteRarity), rarity) then
+        safeFireServer(getRemote(CONFIG.RemoteRarityAlt), rarity)
+    end
+    log("Rarity filter ->", rarity)
+end
+
+local function applyZoneFilter(zone)
+    if not zone or zone == "ALL" then return end
+    safeFireServer(getRemote(CONFIG.RemoteZoneFilter), zone)
+    log("Zone filter ->", zone)
+end
 
 local function setSpeedRemote(en)
     safeFireServer(getRemote(CONFIG.RemoteSpeed), en)
@@ -254,9 +272,8 @@ local function startLoop()
     running = true
     resolveAll()
     if CONFIG.SpeedEnabled then setSpeedRemote(true); applySpeedLocal(true) end
-    if CONFIG.RarityTarget ~= "ALL" then
-        safeFireServer(getRemote(CONFIG.RemoteRarity), CONFIG.RarityTarget)
-    end
+    applyRarityFilter(CONFIG.RarityTarget)
+    applyZoneFilter(CONFIG.ZoneTarget)
     loopThread = task.spawn(function()
         while running do
             local now = os.clock()
@@ -368,6 +385,64 @@ local function makeGUI()
     addToggle("ESP Eggs",         "ESPEnabled")
     addToggle("Anti-AFK",         "AntiAFKEnabled")
     addToggle("Spy Mode",         "SpyModeEnabled")
+
+    -- Rarity selector
+    local rarLabel = Instance.new("TextLabel")
+    rarLabel.Size = UDim2.new(1,0,0,20); rarLabel.BackgroundTransparency = 1
+    rarLabel.Text = "  Target Rarity (steal):"
+    rarLabel.TextColor3 = Color3.fromRGB(180,180,220)
+    rarLabel.Font = Enum.Font.Gotham; rarLabel.TextSize = 12
+    rarLabel.TextXAlignment = Enum.TextXAlignment.Left
+    rarLabel.Parent = scroll
+
+    local RARITY_OPTIONS = {"ALL","Common","Uncommon","Rare","Epic","Legendary","Mythical"}
+    local rarityIdx = 1
+    for i, r in ipairs(RARITY_OPTIONS) do
+        if r == CONFIG.RarityTarget then rarityIdx = i end
+    end
+    local rarBtn = Instance.new("TextButton")
+    rarBtn.Size = UDim2.new(1,0,0,28)
+    rarBtn.BackgroundColor3 = Color3.fromRGB(45,45,70)
+    rarBtn.TextColor3 = Color3.fromRGB(230,230,255)
+    rarBtn.Font = Enum.Font.Gotham; rarBtn.TextSize = 12
+    rarBtn.Text = "  " .. CONFIG.RarityTarget .. "   (klik ganti)"
+    rarBtn.BorderSizePixel = 0; rarBtn.Parent = scroll
+    Instance.new("UICorner", rarBtn).CornerRadius = UDim.new(0,6)
+    rarBtn.MouseButton1Click:Connect(function()
+        rarityIdx = (rarityIdx % #RARITY_OPTIONS) + 1
+        CONFIG.RarityTarget = RARITY_OPTIONS[rarityIdx]
+        rarBtn.Text = "  " .. CONFIG.RarityTarget .. "   (klik ganti)"
+        applyRarityFilter(CONFIG.RarityTarget)
+    end)
+
+    -- Zone selector
+    local zonLabel = Instance.new("TextLabel")
+    zonLabel.Size = UDim2.new(1,0,0,20); zonLabel.BackgroundTransparency = 1
+    zonLabel.Text = "  Target Zone:"
+    zonLabel.TextColor3 = Color3.fromRGB(180,180,220)
+    zonLabel.Font = Enum.Font.Gotham; zonLabel.TextSize = 12
+    zonLabel.TextXAlignment = Enum.TextXAlignment.Left
+    zonLabel.Parent = scroll
+
+    local ZONE_OPTIONS = {"ALL","Zone1","Zone2","Zone3"}
+    local zoneIdx = 1
+    for i, z in ipairs(ZONE_OPTIONS) do
+        if z == CONFIG.ZoneTarget then zoneIdx = i end
+    end
+    local zonBtn = Instance.new("TextButton")
+    zonBtn.Size = UDim2.new(1,0,0,28)
+    zonBtn.BackgroundColor3 = Color3.fromRGB(45,45,70)
+    zonBtn.TextColor3 = Color3.fromRGB(230,230,255)
+    zonBtn.Font = Enum.Font.Gotham; zonBtn.TextSize = 12
+    zonBtn.Text = "  " .. CONFIG.ZoneTarget .. "   (klik ganti)"
+    zonBtn.BorderSizePixel = 0; zonBtn.Parent = scroll
+    Instance.new("UICorner", zonBtn).CornerRadius = UDim.new(0,6)
+    zonBtn.MouseButton1Click:Connect(function()
+        zoneIdx = (zoneIdx % #ZONE_OPTIONS) + 1
+        CONFIG.ZoneTarget = ZONE_OPTIONS[zoneIdx]
+        zonBtn.Text = "  " .. CONFIG.ZoneTarget .. "   (klik ganti)"
+        applyZoneFilter(CONFIG.ZoneTarget)
+    end)
 
     local sep = Instance.new("Frame")
     sep.Size = UDim2.new(1,0,0,1); sep.BackgroundColor3 = Color3.fromRGB(55,55,85)
