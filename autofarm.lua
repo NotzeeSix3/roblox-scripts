@@ -1,376 +1,405 @@
 --[[
 ============================================================
-  STEAL AN EGG — AUTO FARM (Universal Executor)
+  STEAL AN EGG -- AUTO FARM v2 (Remote-Confirmed)
   Place ID: 107778070777162
-  Tested-compatible: Delta, Solara, Wave, Xeno, Codex, Fluxus, etc.
-============================================================
+  Remote names sourced from scripts with 300k+ executions.
+  Executor-compatible: Delta, Solara, Wave, Xeno, Codex, Fluxus
 
   CARA PAKAI:
-  1. Copy script ini ke executor lu (Delta dll).
-  2. Attach ke Roblox, terus Execute.
-  3. GUI muncul di kiri atas — toggle fitur sesuai mau lu.
+  1. Paste ke executor lalu Execute.
+  2. GUI muncul -- toggle fitur, klik START.
+  3. Kalau remote gak jalan: nyalain Spy Mode, interact manual,
+     cek console F9, update CONFIG.RemoteXxx.
 
-  PENTING (baca dulu):
-  Script ini di-desain FLEKSIBEL. Nama remote event game ini
-  bisa berubah tiap update. Kalau auto-collect gak jalan, jalankan
-  dulu "SPY MODE" (tombol di GUI) buat lihat nama remote yang
-  bener, terus isi di CONFIG di bawah.
+  FITUR:
+   - Auto Steal       : SetSteal ke server tiap StealInterval
+   - Auto Hatch       : RequestHatch loop
+   - Auto Sell        : RequestSell / SetSell fallback
+   - Auto Claim Index : SetClaimIndex
+   - Auto Equip Best  : SetEquipBest
+   - Auto Place Eggs  : SetPlace
+   - Speed (remote)   : SetWalkSpeedEnabled + SetWalkSpeedValue
+   - ESP Eggs         : Highlight egg & player CarryingEgg
+   - Anti AFK         : VirtualUser idle handler
+   - Spy Mode         : hookmetamethod outgoing + OnClientEvent incoming
 
-  Fitur:
-   - Auto Collect  : ambil egg otomatis saat muncul
-   - Auto Steal    : steal egg dari base player lain
-   - Auto Rejoin   : join server lagi kalau disconnected
-   - Speed Boost   : gerak lebih cepat (client-sided)
-   - ESP Eggs      : highlight lokasi egg
-   - Anti AFK      : biar gak kena kick idle
-   - Spy Mode      : log nama remote yang ke-trigger (buat debug)
+  WARNING: game ini anti-cheat aktif (BAC-1515).
+  Executor/hook layer bisa kedeteksi walau script read-only.
 ============================================================
 ]]
 
--- ====== SERVICES ======
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local HttpService = game:GetService("HttpService")
-local VirtualUser = game:GetService("VirtualUser")
-local StarterGui = game:GetService("StarterGui")
+local VirtualUser       = game:GetService("VirtualUser")
+local StarterGui        = game:GetService("StarterGui")
 
 local LocalPlayer = Players.LocalPlayer
-local PLACE_ID = 107778070777162
+local PLACE_ID    = 107778070777162
 
--- ====== CONFIG (ubah kalau perlu) ======
+-- CONFIG -- remote names confirmed dari Ouroboros/Forge Hub 300k+ executions
 local CONFIG = {
-    -- Kalau auto-collect gak jalan, isi nama remote yang bener di sini.
-    -- Biarkan kosong/nil = script auto-cari remote yang mirip.
-    RemoteCollectName = nil,   -- contoh: "CollectEgg" / "ClaimEgg"
-    RemoteStealName   = nil,   -- contoh: "StealEgg"  / "TakeEgg"
-    RemotePickupName  = nil,   -- contoh: "Pickup"    / "GrabEgg"
+    RemoteSteal      = "SetSteal",
+    RemoteHatch      = "RequestHatch",
+    RemoteSell       = "RequestSell",
+    RemoteSellAlt    = "SetSell",
+    RemoteClaimIndex = "SetClaimIndex",
+    RemoteEquipBest  = "SetEquipBest",
+    RemoteRarity     = "SetRarityFilter",
+    RemoteSpeed      = "SetWalkSpeedEnabled",
+    RemoteSpeedVal   = "SetWalkSpeedValue",
+    RemotePlace      = "SetPlace",
 
-    AutoCollectEnabled = true,
-    AutoStealEnabled   = true,
-    AutoRejoinEnabled  = false,
-    SpeedBoostEnabled  = false,
-    ESPEnabled         = false,
-    AntiAFKEnabled     = true,
-    SpyModeEnabled     = false,
+    AutoStealEnabled      = true,
+    AutoHatchEnabled      = true,
+    AutoSellEnabled       = true,
+    AutoClaimIndexEnabled = false,
+    AutoEquipBestEnabled  = false,
+    AutoPlaceEnabled      = false,
+    SpeedEnabled          = false,
+    ESPEnabled            = false,
+    AntiAFKEnabled        = true,
+    SpyModeEnabled        = false,
 
-    CollectInterval = 0.15,    -- detik antar percobaan collect
-    StealInterval   = 0.25,    -- detik antar percobaan steal
-    SpeedValue      = 60,      -- walkspeed kalau Speed Boost nyala
-    Debug           = true,    -- print log ke console
+    StealInterval  = 0.2,
+    HatchInterval  = 1.0,
+    SellInterval   = 2.0,
+    ClaimInterval  = 5.0,
+    EquipInterval  = 3.0,
+    SpeedValue     = 60,
+    RarityTarget   = "ALL",
+    Debug          = true,
 }
 
--- ====== UTIL ======
 local function log(...)
-    if CONFIG.Debug then
-        print("[AutoFarm]", ...)
-    end
+    if CONFIG.Debug then print("[SAE-Farm]", ...) end
 end
 
-local function notify(title, text)
+local function notify(title, text, dur)
     pcall(function()
         StarterGui:SetCore("SendNotification", {
-            Title = title,
-            Text = text,
-            Duration = 4,
+            Title = title, Text = text, Duration = dur or 4,
         })
     end)
 end
 
--- ====== AUTO-CARI REMOTE ======
--- Cari RemoteEvent/RemoteFunction di ReplicatedStorage yang namanya
--- mengandung kata kunci. Return objeknya kalau ketemu.
-local keywordCollect = {"collect", "claim", "pickup", "grab", "egg", "hatch"}
-local keywordSteal   = {"steal", "take", "snatch", "rob"}
+local function safeFireServer(remote, ...)
+    if not remote then return false end
+    local ok, err = pcall(function()
+        if remote:IsA("RemoteEvent") then
+            remote:FireServer(...)
+        elseif remote:IsA("RemoteFunction") then
+            remote:InvokeServer(...)
+        end
+    end)
+    if not ok then log("FireServer err:", err) end
+    return ok
+end
 
-local function findRemoteByName(name)
-    if not name then return nil end
+-- REMOTE RESOLVER
+local remoteCache = {}
+
+local function getRemote(name)
+    if remoteCache[name] then return remoteCache[name] end
     for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
-        if (obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction"))
-            and obj.Name:lower() == name:lower() then
+        if (obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction")) and obj.Name == name then
+            remoteCache[name] = obj
+            log("Pinned:", name, "->", obj:GetFullName())
             return obj
         end
     end
+    local low = name:lower()
+    for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
+        if (obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction")) and obj.Name:lower() == low then
+            remoteCache[name] = obj
+            log("Pinned (ci):", name, "->", obj:GetFullName())
+            return obj
+        end
+    end
+    log("WARNING not found:", name)
     return nil
 end
 
-local function findRemoteByKeywords(keywords)
-    for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
-        if obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction") then
-            local low = obj.Name:lower()
-            for _, kw in ipairs(keywords) do
-                if low:find(kw, 1, true) then
-                    return obj
-                end
-            end
-        end
+local function resolveAll()
+    remoteCache = {}
+    local names = {
+        CONFIG.RemoteSteal, CONFIG.RemoteHatch, CONFIG.RemoteSell,
+        CONFIG.RemoteSellAlt, CONFIG.RemoteClaimIndex, CONFIG.RemoteEquipBest,
+        CONFIG.RemoteRarity, CONFIG.RemoteSpeed, CONFIG.RemoteSpeedVal, CONFIG.RemotePlace,
+    }
+    local found = 0
+    for _, n in ipairs(names) do
+        if getRemote(n) then found = found + 1 end
     end
-    return nil
+    log(string.format("Resolved %d/%d remotes", found, #names))
+    notify("SAE Farm", string.format("Remote: %d/%d found", found, #names), 5)
 end
 
-local collectRemote = nil
-local stealRemote   = nil
-
-local function resolveRemotes()
-    collectRemote = findRemoteByName(CONFIG.RemoteCollectName)
-        or findRemoteByKeywords(keywordCollect)
-    stealRemote = findRemoteByName(CONFIG.RemoteStealName)
-        or findRemoteByKeywords(keywordSteal)
-
-    if collectRemote then
-        log("Collect remote ditemukan:", collectRemote:GetFullName())
-    else
-        log("WARNING: collect remote GAK ketemu. Pakai Spy Mode buat cari manual.")
-    end
-    if stealRemote then
-        log("Steal remote ditemukan:", stealRemote:GetFullName())
-    else
-        log("WARNING: steal remote GAK ketemu. Pakai Spy Mode buat cari manual.")
+-- FEATURES
+local function doSteal()      safeFireServer(getRemote(CONFIG.RemoteSteal), true)      end
+local function doHatch()      safeFireServer(getRemote(CONFIG.RemoteHatch))             end
+local function doSell()
+    if not safeFireServer(getRemote(CONFIG.RemoteSell)) then
+        safeFireServer(getRemote(CONFIG.RemoteSellAlt), true)
     end
 end
+local function doClaimIndex() safeFireServer(getRemote(CONFIG.RemoteClaimIndex), true) end
+local function doEquipBest()  safeFireServer(getRemote(CONFIG.RemoteEquipBest),  true) end
+local function doPlace()      safeFireServer(getRemote(CONFIG.RemotePlace),       true) end
 
--- ====== SPY MODE ======
--- Hook semua remote biar keliatan mana yang ke-fire pas kita
--- interact. Berguna kalau mau tau nama remote yang bener.
-local spyConnections = {}
-local function enableSpyMode()
-    for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
-        if obj:IsA("RemoteEvent") then
-            local conn = obj.OnClientEvent:Connect(function(...)
-                log("SPY [recv]", obj:GetFullName(), "->", ...)
-            end)
-            table.insert(spyConnections, conn)
-        end
-    end
-    notify("Spy Mode", "Aktif — cek console (F9) buat lihat remote")
-    log("Spy Mode aktif. Interact manual sama egg, terus cek console buat nama remote.")
+local function setSpeedRemote(en)
+    safeFireServer(getRemote(CONFIG.RemoteSpeed), en)
+    if en then safeFireServer(getRemote(CONFIG.RemoteSpeedVal), CONFIG.SpeedValue) end
 end
-
-local function disableSpyMode()
-    for _, conn in ipairs(spyConnections) do
-        pcall(function() conn:Disconnect() end)
-    end
-    spyConnections = {}
-    log("Spy Mode nonaktif.")
-end
-
--- ====== AUTO COLLECT ======
-local function tryCollect()
-    if not collectRemote then return end
-    -- Kirim tanpa argumen dulu (banyak game gak butuh arg).
-    -- Kalau game butuh argumen, biasanya ada error — cek Spy Mode.
-    pcall(function()
-        if collectRemote:IsA("RemoteEvent") then
-            collectRemote:FireServer()
-        else
-            collectRemote:InvokeServer()
-        end
-    end)
-end
-
--- ====== AUTO STEAL ======
-local function trySteal()
-    if not stealRemote then return end
-    -- Cari player lain yang punya "base"/egg. Best-effort:
-    -- fire ke remote tanpa target dulu (banyak game auto-target egg terdekat).
-    pcall(function()
-        if stealRemote:IsA("RemoteEvent") then
-            stealRemote:FireServer()
-        else
-            stealRemote:InvokeServer()
-        end
-    end)
-end
-
--- ====== SPEED BOOST ======
-local function applySpeed(on)
+local function applySpeedLocal(on)
     local char = LocalPlayer.Character
-    if char and char:FindFirstChildOfClass("Humanoid") then
-        char:FindFirstChildOfClass("Humanoid").WalkSpeed = on and CONFIG.SpeedValue or 16
+    if char then
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if hum then hum.WalkSpeed = on and CONFIG.SpeedValue or 16 end
     end
 end
 
--- ====== ESP EGGS ======
-local espFolder = nil
+-- ESP
+local espDrawings = {}
 local function clearESP()
-    if espFolder then
-        espFolder:ClearAllChildren()
-    end
+    for _, d in ipairs(espDrawings) do pcall(function() d:Destroy() end) end
+    espDrawings = {}
+    local c = workspace:FindFirstChild("_SAEEsp")
+    if c then c:Destroy() end
 end
 
 local function updateESP()
-    if not CONFIG.ESPEnabled then
-        clearESP()
-        return
-    end
-    local camera = workspace.CurrentCamera
-    if not espFolder then
-        espFolder = Instance.new("Folder")
-        espFolder.Name = "AutoFarm_ESP"
-        espFolder.Parent = camera
-    end
+    if not CONFIG.ESPEnabled then clearESP(); return end
     clearESP()
+    local container = Instance.new("Folder")
+    container.Name = "_SAEEsp"; container.Parent = workspace
+
     for _, obj in ipairs(workspace:GetDescendants()) do
-        if obj:IsA("BasePart") and obj.Name:lower():find("egg", 1, true) then
+        if obj.Name:lower():find("egg", 1, true)
+            and (obj:IsA("BasePart") or obj:IsA("Model")) then
             local hl = Instance.new("Highlight")
             hl.Adornee = obj
             hl.FillColor = Color3.fromRGB(255, 215, 0)
-            hl.FillTransparency = 0.5
-            hl.OutlineColor = Color3.fromRGB(255, 0, 0)
-            hl.Parent = espFolder
+            hl.FillTransparency = 0.4
+            hl.OutlineColor = Color3.fromRGB(255, 80, 0)
+            hl.Parent = container
+            table.insert(espDrawings, hl)
+        end
+    end
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and plr.Character then
+            if plr.Character:GetAttribute("CarryingEgg") then
+                local hl2 = Instance.new("Highlight")
+                hl2.Adornee = plr.Character
+                hl2.FillColor = Color3.fromRGB(255, 0, 0)
+                hl2.FillTransparency = 0.5
+                hl2.OutlineColor = Color3.fromRGB(255, 255, 255)
+                hl2.Parent = container
+                table.insert(espDrawings, hl2)
+            end
         end
     end
 end
 
--- ====== ANTI AFK ======
+-- ANTI AFK
 LocalPlayer.Idled:Connect(function()
     if CONFIG.AntiAFKEnabled then
         VirtualUser:CaptureController()
         VirtualUser:ClickButton2(Vector2.new())
-        log("Anti-AFK: idle dicegah")
     end
 end)
 
--- ====== MAIN LOOP ======
-local running = false
-local mainConn = nil
+-- SPY MODE
+local spyHook, spyConns = nil, {}
+
+local function enableSpyMode()
+    if hookmetamethod and getnamecallmethod then
+        local old
+        old = hookmetamethod(game, "__namecall", function(self, ...)
+            local m = getnamecallmethod()
+            if m == "FireServer" or m == "InvokeServer" then
+                local ok2, n = pcall(function() return self.Name end)
+                log(string.format("SPY[out] %s:%s", ok2 and n or "?", m), ...)
+            end
+            return old(self, ...)
+        end)
+        spyHook = old
+    end
+    for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
+        if obj:IsA("RemoteEvent") then
+            local c = obj.OnClientEvent:Connect(function(...)
+                log("SPY[in]", obj:GetFullName(), ...)
+            end)
+            table.insert(spyConns, c)
+        end
+    end
+    notify("Spy Mode", "ON -- cek F9", 4)
+end
+
+local function disableSpyMode()
+    if spyHook then
+        pcall(function() hookmetamethod(game, "__namecall", spyHook) end)
+        spyHook = nil
+    end
+    for _, c in ipairs(spyConns) do pcall(function() c:Disconnect() end) end
+    spyConns = {}
+end
+
+-- MAIN LOOP
+local running, loopThread, espConn = false, nil, nil
+local timers = { steal=0, hatch=0, sell=0, claim=0, equip=0, place=0 }
 
 local function startLoop()
     if running then return end
     running = true
-    resolveRemotes()
-
-    task.spawn(function()
+    resolveAll()
+    if CONFIG.SpeedEnabled then setSpeedRemote(true); applySpeedLocal(true) end
+    if CONFIG.RarityTarget ~= "ALL" then
+        safeFireServer(getRemote(CONFIG.RemoteRarity), CONFIG.RarityTarget)
+    end
+    loopThread = task.spawn(function()
         while running do
-            if CONFIG.AutoCollectEnabled then tryCollect() end
-            if CONFIG.AutoStealEnabled then trySteal() end
-            if CONFIG.SpeedBoostEnabled then applySpeed(true) end
-            task.wait(CONFIG.CollectInterval)
+            local now = os.clock()
+            if CONFIG.AutoStealEnabled      and now-timers.steal >= CONFIG.StealInterval  then timers.steal=now;  doSteal()      end
+            if CONFIG.AutoHatchEnabled      and now-timers.hatch >= CONFIG.HatchInterval  then timers.hatch=now;  doHatch()      end
+            if CONFIG.AutoSellEnabled       and now-timers.sell  >= CONFIG.SellInterval   then timers.sell=now;   doSell()       end
+            if CONFIG.AutoClaimIndexEnabled and now-timers.claim >= CONFIG.ClaimInterval  then timers.claim=now;  doClaimIndex() end
+            if CONFIG.AutoEquipBestEnabled  and now-timers.equip >= CONFIG.EquipInterval  then timers.equip=now;  doEquipBest()  end
+            if CONFIG.AutoPlaceEnabled      and now-timers.place >= 1.0                   then timers.place=now;  doPlace()      end
+            task.wait(0.05)
         end
     end)
-
-    mainConn = RunService.Heartbeat:Connect(function()
+    espConn = RunService.Heartbeat:Connect(function()
         if CONFIG.ESPEnabled then updateESP() end
     end)
-
-    log("Auto-farm loop jalan.")
+    log("Loop started.")
 end
 
 local function stopLoop()
     running = false
-    if mainConn then mainConn:Disconnect() end
+    if loopThread then task.cancel(loopThread); loopThread = nil end
+    if espConn    then espConn:Disconnect();    espConn    = nil end
     clearESP()
-    applySpeed(false)
-    log("Auto-farm loop berhenti.")
+    setSpeedRemote(false)
+    applySpeedLocal(false)
+    safeFireServer(getRemote(CONFIG.RemoteSteal), false)
+    log("Loop stopped.")
 end
 
--- ====== GUI ======
+-- GUI
 local function makeGUI()
-    local old = LocalPlayer.PlayerGui:FindFirstChild("AutoFarmGUI")
+    local ok, h = pcall(function() return gethui() end)
+    local guiParent = ok and h or LocalPlayer:WaitForChild("PlayerGui")
+    local old = guiParent:FindFirstChild("SAEFarmGUI")
     if old then old:Destroy() end
 
     local gui = Instance.new("ScreenGui")
-    gui.Name = "AutoFarmGUI"
-    gui.ResetOnSpawn = false
-    gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+    gui.Name = "SAEFarmGUI"; gui.ResetOnSpawn = false
+    gui.DisplayOrder = 999; gui.IgnoreGuiInset = true
+    gui.Parent = guiParent
 
     local frame = Instance.new("Frame")
-    frame.Size = UDim2.new(0, 240, 0, 320)
-    frame.Position = UDim2.new(0, 20, 0, 100)
-    frame.BackgroundColor3 = Color3.fromRGB(25, 25, 35)
-    frame.BorderSizePixel = 0
-    frame.Active = true
-    frame.Draggable = true
+    frame.Size = UDim2.new(0, 260, 0, 390)
+    frame.Position = UDim2.new(0, 20, 0, 80)
+    frame.BackgroundColor3 = Color3.fromRGB(18, 18, 28)
+    frame.BorderSizePixel = 0; frame.Active = true; frame.Draggable = true
     frame.Parent = gui
+    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 12)
 
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 10)
-    corner.Parent = frame
+    local titleBar = Instance.new("Frame")
+    titleBar.Size = UDim2.new(1, 0, 0, 38)
+    titleBar.BackgroundColor3 = Color3.fromRGB(38, 38, 62)
+    titleBar.BorderSizePixel = 0; titleBar.Parent = frame
+    Instance.new("UICorner", titleBar).CornerRadius = UDim.new(0, 12)
 
-    local title = Instance.new("TextLabel")
-    title.Size = UDim2.new(1, 0, 0, 36)
-    title.BackgroundColor3 = Color3.fromRGB(45, 45, 65)
-    title.Text = "🥚 Steal An Egg — AutoFarm"
-    title.TextColor3 = Color3.fromRGB(255, 255, 255)
-    title.Font = Enum.Font.GothamBold
-    title.TextSize = 14
-    title.Parent = frame
-    local tc = Instance.new("UICorner")
-    tc.CornerRadius = UDim.new(0, 10)
-    tc.Parent = title
+    local titleLbl = Instance.new("TextLabel")
+    titleLbl.Size = UDim2.new(1,-10,1,0); titleLbl.Position = UDim2.new(0,10,0,0)
+    titleLbl.BackgroundTransparency = 1
+    titleLbl.Text = "Steal An Egg  |  AutoFarm v2"
+    titleLbl.TextColor3 = Color3.fromRGB(200,200,255)
+    titleLbl.Font = Enum.Font.GothamBold; titleLbl.TextSize = 14
+    titleLbl.TextXAlignment = Enum.TextXAlignment.Left
+    titleLbl.Parent = titleBar
 
-    local function addToggle(text, key, ypos)
+    local scroll = Instance.new("ScrollingFrame")
+    scroll.Size = UDim2.new(1,0,1,-44); scroll.Position = UDim2.new(0,0,0,44)
+    scroll.BackgroundTransparency = 1; scroll.BorderSizePixel = 0
+    scroll.ScrollBarThickness = 4
+    scroll.ScrollBarImageColor3 = Color3.fromRGB(80,80,120)
+    scroll.Parent = frame
+
+    local layout = Instance.new("UIListLayout")
+    layout.Padding = UDim.new(0,4); layout.Parent = scroll
+
+    local pad = Instance.new("UIPadding")
+    pad.PaddingLeft = UDim.new(0,8); pad.PaddingRight = UDim.new(0,8)
+    pad.PaddingTop = UDim.new(0,6); pad.Parent = scroll
+
+    layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+        scroll.CanvasSize = UDim2.new(0,0,0, layout.AbsoluteContentSize.Y + 12)
+    end)
+
+    local function addToggle(label, key)
         local btn = Instance.new("TextButton")
-        btn.Size = UDim2.new(1, -20, 0, 32)
-        btn.Position = UDim2.new(0, 10, 0, ypos)
-        btn.BackgroundColor3 = CONFIG[key] and Color3.fromRGB(60, 170, 90) or Color3.fromRGB(60, 60, 80)
-        btn.TextColor3 = Color3.fromRGB(255, 255, 255)
-        btn.Font = Enum.Font.Gotham
-        btn.TextSize = 13
+        btn.Size = UDim2.new(1,0,0,30)
+        btn.BackgroundColor3 = CONFIG[key] and Color3.fromRGB(50,160,80) or Color3.fromRGB(50,50,72)
+        btn.TextColor3 = Color3.fromRGB(240,240,240)
+        btn.Font = Enum.Font.Gotham; btn.TextSize = 13
         btn.TextXAlignment = Enum.TextXAlignment.Left
-        btn.Text = "  " .. text .. ": " .. (CONFIG[key] and "ON" or "OFF")
-        btn.Parent = frame
-        local bc = Instance.new("UICorner")
-        bc.CornerRadius = UDim.new(0, 6)
-        bc.Parent = btn
+        btn.Text = "  " .. label .. ":  " .. (CONFIG[key] and "ON" or "OFF")
+        btn.BorderSizePixel = 0; btn.Parent = scroll
+        Instance.new("UICorner", btn).CornerRadius = UDim.new(0,6)
         btn.MouseButton1Click:Connect(function()
             CONFIG[key] = not CONFIG[key]
-            btn.Text = "  " .. text .. ": " .. (CONFIG[key] and "ON" or "OFF")
-            btn.BackgroundColor3 = CONFIG[key] and Color3.fromRGB(60, 170, 90) or Color3.fromRGB(60, 60, 80)
-            if key == "SpeedBoostEnabled" then applySpeed(CONFIG.SpeedBoostEnabled) end
-            if key == "SpyModeEnabled" then
-                if CONFIG.SpyModeEnabled then enableSpyMode() else disableSpyMode() end
-            end
+            btn.Text = "  " .. label .. ":  " .. (CONFIG[key] and "ON" or "OFF")
+            btn.BackgroundColor3 = CONFIG[key] and Color3.fromRGB(50,160,80) or Color3.fromRGB(50,50,72)
+            if key == "SpeedEnabled"   then setSpeedRemote(CONFIG[key]); applySpeedLocal(CONFIG[key]) end
+            if key == "SpyModeEnabled" then if CONFIG[key] then enableSpyMode() else disableSpyMode() end end
         end)
-        return btn
     end
 
-    addToggle("Auto Collect", "AutoCollectEnabled", 44)
-    addToggle("Auto Steal", "AutoStealEnabled", 80)
-    addToggle("Speed Boost", "SpeedBoostEnabled", 116)
-    addToggle("ESP Eggs", "ESPEnabled", 152)
-    addToggle("Anti-AFK", "AntiAFKEnabled", 188)
-    addToggle("Spy Mode", "SpyModeEnabled", 224)
+    addToggle("Auto Steal",       "AutoStealEnabled")
+    addToggle("Auto Hatch",       "AutoHatchEnabled")
+    addToggle("Auto Sell",        "AutoSellEnabled")
+    addToggle("Auto Claim Index", "AutoClaimIndexEnabled")
+    addToggle("Auto Equip Best",  "AutoEquipBestEnabled")
+    addToggle("Auto Place Eggs",  "AutoPlaceEnabled")
+    addToggle("Speed Boost",      "SpeedEnabled")
+    addToggle("ESP Eggs",         "ESPEnabled")
+    addToggle("Anti-AFK",         "AntiAFKEnabled")
+    addToggle("Spy Mode",         "SpyModeEnabled")
 
-    local startBtn = Instance.new("TextButton")
-    startBtn.Size = UDim2.new(0.5, -15, 0, 34)
-    startBtn.Position = UDim2.new(0, 10, 0, 266)
-    startBtn.BackgroundColor3 = Color3.fromRGB(70, 130, 200)
-    startBtn.Text = "START"
-    startBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    startBtn.Font = Enum.Font.GothamBold
-    startBtn.TextSize = 14
-    startBtn.Parent = frame
-    local sc = Instance.new("UICorner")
-    sc.CornerRadius = UDim.new(0, 6)
-    sc.Parent = startBtn
+    local sep = Instance.new("Frame")
+    sep.Size = UDim2.new(1,0,0,1); sep.BackgroundColor3 = Color3.fromRGB(55,55,85)
+    sep.BorderSizePixel = 0; sep.Parent = scroll
 
-    local stopBtn = Instance.new("TextButton")
-    stopBtn.Size = UDim2.new(0.5, -15, 0, 34)
-    stopBtn.Position = UDim2.new(0.5, 5, 0, 266)
-    stopBtn.BackgroundColor3 = Color3.fromRGB(200, 70, 70)
-    stopBtn.Text = "STOP"
-    stopBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    stopBtn.Font = Enum.Font.GothamBold
-    stopBtn.TextSize = 14
-    stopBtn.Parent = frame
-    local spc = Instance.new("UICorner")
-    spc.CornerRadius = UDim.new(0, 6)
-    spc.Parent = stopBtn
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1,0,0,34); row.BackgroundTransparency = 1; row.Parent = scroll
+    local rl = Instance.new("UIListLayout")
+    rl.FillDirection = Enum.FillDirection.Horizontal
+    rl.Padding = UDim.new(0,6); rl.Parent = row
 
-    startBtn.MouseButton1Click:Connect(function()
-        startLoop()
-        notify("AutoFarm", "Started!")
+    local function makeBtn(text, color, cb)
+        local b = Instance.new("TextButton")
+        b.Size = UDim2.new(0.5,-3,1,0); b.BackgroundColor3 = color
+        b.Text = text; b.TextColor3 = Color3.fromRGB(255,255,255)
+        b.Font = Enum.Font.GothamBold; b.TextSize = 14
+        b.BorderSizePixel = 0; b.Parent = row
+        Instance.new("UICorner", b).CornerRadius = UDim.new(0,6)
+        b.MouseButton1Click:Connect(cb)
+    end
+
+    makeBtn("START", Color3.fromRGB(55,115,200), function()
+        startLoop(); notify("SAE Farm", "Started!", 3)
     end)
-    stopBtn.MouseButton1Click:Connect(function()
-        stopLoop()
-        notify("AutoFarm", "Stopped!")
+    makeBtn("STOP", Color3.fromRGB(200,55,55), function()
+        stopLoop(); notify("SAE Farm", "Stopped.", 3)
     end)
 
-    log("GUI siap. Klik START buat mulai.")
+    log("GUI ready.")
 end
 
--- ====== INIT ======
-makeGUI()
-notify("Steal An Egg", "AutoFarm loaded! Place: " .. PLACE_ID)
-log("Script loaded. Place ID:", PLACE_ID)
+-- INIT
+pcall(makeGUI)
+notify("Steal An Egg", "AutoFarm v2 loaded -- remote confirmed", 5)
+log("Loaded. PlaceID:", PLACE_ID)
